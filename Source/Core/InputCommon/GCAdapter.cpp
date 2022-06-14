@@ -103,11 +103,14 @@ constexpr size_t CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE = 1;
 constexpr size_t CONTROLLER_OUTPUT_HARD_RESET_PAYLOAD_SIZE = 1;
 constexpr size_t CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE = 5;
 
+static std::array<u8, CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE> s_controller_origin_payload;
+static std::array<u8, CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE> s_controller_origin_payload_swap;
 static std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> s_controller_payload;
 static std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> s_controller_payload_swap;
 
 // Only access with s_mutex held!
 static int s_controller_payload_size = {0};
+static int s_controller_origin_payload_size = {0};
 
 static std::array<u8, CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> s_controller_rumble_payload;
 static std::atomic<int> s_controller_rumble_payload_size{0};
@@ -119,6 +122,7 @@ static Common::Flag s_rumble_adapter_thread_running;
 static Common::Event s_rumble_happened;
 
 static std::mutex s_poll_mutex;
+static std::mutex s_origin_mutex;
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
 static std::mutex s_init_mutex;
 static std::mutex s_write_mutex;
@@ -301,18 +305,19 @@ static void Rumble()
 
 static void Origins()
 {
+  int size = 0;
+  int origin_size = 0;
+  int error = LIBUSB_SUCCESS;
   {
     std::lock_guard<std::mutex> read_lk(s_read_mutex);
     std::lock_guard<std::mutex> write_lk(s_write_mutex);
-    int size = 0;
     // suspend polling
     std::array<u8, CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE> suspend_payload = {0x14};
-    int error = libusb_interrupt_transfer(s_handle, s_endpoint_out, suspend_payload.data(),
+    error = libusb_interrupt_transfer(s_handle, s_endpoint_out, suspend_payload.data(),
                                       CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE, &size, 16);
 
     // read suspend result
     std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> suspend_result;
-
     error =
         libusb_interrupt_transfer(s_handle, s_endpoint_in, suspend_result.data(),
                                   CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE, &size, 16);
@@ -323,14 +328,19 @@ static void Origins()
                                       CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE, &size, 16);
 
     // read origins
-    std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> origin_result;
-    error = libusb_interrupt_transfer(s_handle, s_endpoint_in, origin_result.data(),
-                                      CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE, &size, 16);
+    error = libusb_interrupt_transfer(s_handle, s_endpoint_in, s_controller_origin_payload_swap.data(),
+                                  CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE, &origin_size, 16);
 
     // resume polling
     std::array<u8, CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE> resume_payload = {0x13};
     error = libusb_interrupt_transfer(s_handle, s_endpoint_out, resume_payload.data(),
                                           CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE, &size, 16);
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(s_origin_mutex);
+    std::swap(s_controller_origin_payload_swap, s_controller_origin_payload);
+    s_controller_origin_payload_size = origin_size;
   }
 }
 
@@ -772,7 +782,7 @@ GCPadStatus Input(int chan)
   GCPadStatus pad = {};
   if (payload_size != CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
-      || controller_payload_copy[0] != LIBUSB_DT_HID
+      || controller_payload_copy[0] != 0x21
 #endif
   )
   {
@@ -918,7 +928,44 @@ static void ResetRumbleLockNeeded()
 
 GCPadStatus Origin(int chan)
 {
-  GCPadStatus origin = GCPadStatus();
+  if (!UseAdapter())
+    return {};
+
+  if (s_handle == nullptr || s_status != ADAPTER_DETECTED)
+    return {};
+
+  int payload_size = 0;
+  std::array<u8, CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE> controller_origin_payload_copy{};
+
+  {
+    std::lock_guard<std::mutex> lk(s_origin_mutex);
+    controller_origin_payload_copy = s_controller_origin_payload;
+    payload_size = s_controller_origin_payload_size;
+  }
+
+  GCPadStatus origin = {};
+  if (payload_size != CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE
+#if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
+      || controller_origin_payload_copy[0] != 0x22
+#endif
+  )
+  {
+    // This can occur for a few frames on initialization.
+    ERROR_LOG_FMT(CONTROLLERINTERFACE, "error reading payload (size: {}, type: {:02x})",
+                  payload_size, controller_origin_payload_copy[0]);
+  }
+  else
+  {
+    origin.stickX = controller_origin_payload_copy[1 + (chan * 6)];
+    origin.stickY = controller_origin_payload_copy[1 + (chan * 6) + 1];
+    origin.substickX = controller_origin_payload_copy[1 + (chan * 6) + 2];
+    origin.substickY = controller_origin_payload_copy[1 + (chan * 6) + 3];
+    origin.triggerLeft = controller_origin_payload_copy[1 + (chan * 6) + 4];
+    origin.triggerRight = controller_origin_payload_copy[1 + (chan * 6) + 5];
+  }
+  // TODO: do we need that Core::WantsDeterminism hack?
+  // TODO: handle android implementation
+
   return origin;
 }
 
