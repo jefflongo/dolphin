@@ -91,6 +91,7 @@ enum class ControllerType : u8
 
 static std::array<ControllerType, SerialInterface::MAX_SI_CHANNELS> s_controller_type = {
     ControllerType::None, ControllerType::None, ControllerType::None, ControllerType::None};
+static std::array<u8, SerialInterface::MAX_SI_CHANNELS> s_controller_origin_valid = {false, false, false, false};
 static std::array<u8, SerialInterface::MAX_SI_CHANNELS> s_controller_rumble{};
 
 constexpr size_t CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE = 37;
@@ -341,6 +342,7 @@ static void Origins()
     std::lock_guard<std::mutex> lk(s_origin_mutex);
     std::swap(s_controller_origin_payload_swap, s_controller_origin_payload);
     s_controller_origin_payload_size = origin_size;
+    s_controller_origin_valid = {true, true, true, true};
   }
 }
 
@@ -796,13 +798,23 @@ GCPadStatus Input(int chan)
   else
   {
     bool get_origin = false;
+    bool new_controller = false;
     // TODO: What do the other bits here indicate?  Does casting to an enum like this make sense?
     const auto type = static_cast<ControllerType>(controller_payload_copy[1 + (9 * chan)] >> 4);
     if (type != ControllerType::None && s_controller_type[chan] == ControllerType::None)
     {
+      new_controller = true;
       NOTICE_LOG_FMT(CONTROLLERINTERFACE, "New device connected to Port {} of Type: {:02x}",
                      chan + 1, controller_payload_copy[1 + (9 * chan)]);
-      get_origin = true;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(s_origin_mutex);
+      if (new_controller)
+      {
+        s_controller_origin_valid[chan] = false;
+      }
+      get_origin = s_controller_origin_valid[chan];
     }
 
     s_controller_type[chan] = type;
@@ -939,6 +951,8 @@ GCPadStatus Origin(int chan)
 
   {
     std::lock_guard<std::mutex> lk(s_origin_mutex);
+    if (!s_controller_origin_valid[chan])
+      return {};
     controller_origin_payload_copy = s_controller_origin_payload;
     payload_size = s_controller_origin_payload_size;
   }
