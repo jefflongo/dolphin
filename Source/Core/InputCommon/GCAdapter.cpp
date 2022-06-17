@@ -63,6 +63,7 @@ static void Reset();
 static void Setup();
 static void Poll();
 static void Rumble();
+static void Origins();
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
 enum
@@ -91,7 +92,7 @@ enum class ControllerType : u8
 
 static std::array<ControllerType, SerialInterface::MAX_SI_CHANNELS> s_controller_type = {
     ControllerType::None, ControllerType::None, ControllerType::None, ControllerType::None};
-static std::array<u8, SerialInterface::MAX_SI_CHANNELS> s_controller_origin_valid = {false, false, false, false};
+static std::array<bool, SerialInterface::MAX_SI_CHANNELS> s_controller_origin_valid = {false, false, false, false};
 static std::array<u8, SerialInterface::MAX_SI_CHANNELS> s_controller_rumble{};
 
 constexpr size_t CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE = 37;
@@ -121,6 +122,9 @@ static Common::Flag s_poll_adapter_thread_running;
 static std::thread s_rumble_adapter_thread;
 static Common::Flag s_rumble_adapter_thread_running;
 static Common::Event s_rumble_happened;
+static std::thread s_origin_adapter_thread;
+static Common::Flag s_origin_adapter_thread_running;
+static Common::Event s_origin_requested;
 
 static std::mutex s_poll_mutex;
 static std::mutex s_origin_mutex;
@@ -194,6 +198,8 @@ static void Poll()
 
   s_rumble_adapter_thread_running.Set(true);
   s_rumble_adapter_thread = std::thread(Rumble);
+  s_origin_adapter_thread_running.Set(true);
+  s_origin_adapter_thread = std::thread(Origins);
 
   // Reset rumble once on initial poll
   ResetRumble();
@@ -243,6 +249,13 @@ static void Poll()
     s_controller_rumble_payload_size.store(0);
     s_rumble_happened.Set();  // Kick the waiting event
     s_rumble_adapter_thread.join();
+  }
+
+  // Terminate origin thread
+  if (s_origin_adapter_thread_running.TestAndClear())
+  {
+    s_origin_requested.Set(); // Kick the waiting event  
+    s_origin_adapter_thread.join();
   }
 
 #if GCADAPTER_USE_ANDROID_IMPLEMENTATION
@@ -306,44 +319,58 @@ static void Rumble()
 
 static void Origins()
 {
-  int size = 0;
-  int origin_size = 0;
-  int error = LIBUSB_SUCCESS;
+  Common::SetCurrentThreadName("GCAdapter Origin Thread");
+  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter origin thread started");
+
+  while (true)
   {
-    std::lock_guard<std::mutex> read_lk(s_read_mutex);
-    std::lock_guard<std::mutex> write_lk(s_write_mutex);
-    // suspend polling
-    std::array<u8, CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE> suspend_payload = {0x14};
-    error = libusb_interrupt_transfer(s_handle, s_endpoint_out, suspend_payload.data(),
-                                      CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE, &size, 16);
+    s_origin_requested.Wait();
 
-    // read suspend result
-    std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> suspend_result;
-    error =
-        libusb_interrupt_transfer(s_handle, s_endpoint_in, suspend_result.data(),
-                                  CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE, &size, 16);
+    if (!s_origin_adapter_thread_running.IsSet())
+      break;
 
-    // request origins
-    std::array<u8, CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE> origin_payload = {0x12};
-    error = libusb_interrupt_transfer(s_handle, s_endpoint_out, origin_payload.data(),
-                                      CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE, &size, 16);
+    int size = 0;
+    int origin_size = 0;
+    int error = LIBUSB_SUCCESS;
 
-    // read origins
-    error = libusb_interrupt_transfer(s_handle, s_endpoint_in, s_controller_origin_payload_swap.data(),
-                                  CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE, &origin_size, 16);
+    {
+      std::lock_guard<std::mutex> read_lk(s_read_mutex);
+      std::lock_guard<std::mutex> write_lk(s_write_mutex);
+      // suspend polling
+      std::array<u8, CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE> suspend_payload = {0x14};
+      error = libusb_interrupt_transfer(s_handle, s_endpoint_out, suspend_payload.data(),
+                                        CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE, &size, 16);
 
-    // resume polling
-    std::array<u8, CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE> resume_payload = {0x13};
-    error = libusb_interrupt_transfer(s_handle, s_endpoint_out, resume_payload.data(),
-                                          CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE, &size, 16);
+      // read suspend result
+      std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> suspend_result;
+      error = libusb_interrupt_transfer(s_handle, s_endpoint_in, suspend_result.data(),
+                                        CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE, &size, 16);
+
+      // request origins
+      std::array<u8, CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE> origin_payload = {0x12};
+      error = libusb_interrupt_transfer(s_handle, s_endpoint_out, origin_payload.data(),
+                                        CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE, &size, 16);
+
+      // read origins
+      error = libusb_interrupt_transfer(
+          s_handle, s_endpoint_in, s_controller_origin_payload_swap.data(),
+          CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE, &origin_size, 16);
+
+      // resume polling
+      std::array<u8, CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE> resume_payload = {0x13};
+      error = libusb_interrupt_transfer(s_handle, s_endpoint_out, resume_payload.data(),
+                                        CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE, &size, 16);
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(s_origin_mutex);
+      std::swap(s_controller_origin_payload_swap, s_controller_origin_payload);
+      s_controller_origin_payload_size = origin_size;
+      s_controller_origin_valid.fill(true);
+    }
   }
 
-  {
-    std::lock_guard<std::mutex> lk(s_origin_mutex);
-    std::swap(s_controller_origin_payload_swap, s_controller_origin_payload);
-    s_controller_origin_payload_size = origin_size;
-    s_controller_origin_valid = {true, true, true, true};
-  }
+  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter origin thread stopped");
 }
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
@@ -814,7 +841,7 @@ GCPadStatus Input(int chan)
       {
         s_controller_origin_valid[chan] = false;
       }
-      get_origin = s_controller_origin_valid[chan];
+      get_origin = !s_controller_origin_valid[chan];
     }
 
     s_controller_type[chan] = type;
@@ -852,7 +879,10 @@ GCPadStatus Input(int chan)
         pad.button |= PAD_TRIGGER_L;
 
       if (get_origin)
+      {
         pad.button |= PAD_GET_ORIGIN;
+        s_origin_requested.Set();
+      }
 
       pad.stickX = controller_payload_copy[1 + (9 * chan) + 3];
       pad.stickY = controller_payload_copy[1 + (9 * chan) + 4];
