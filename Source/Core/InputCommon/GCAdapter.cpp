@@ -61,8 +61,9 @@ static void ResetRumbleLockNeeded();
 #endif
 static void Reset();
 static void Setup();
-static void Read();
-static void Write();
+static void Poll();
+static void Rumble();
+static void Origins();
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
 enum
@@ -91,32 +92,48 @@ enum class ControllerType : u8
 
 static std::array<ControllerType, SerialInterface::MAX_SI_CHANNELS> s_controller_type = {
     ControllerType::None, ControllerType::None, ControllerType::None, ControllerType::None};
+static std::array<bool, SerialInterface::MAX_SI_CHANNELS> s_controller_origin_valid = {false, false, false, false};
 static std::array<u8, SerialInterface::MAX_SI_CHANNELS> s_controller_rumble{};
 
-constexpr size_t CONTROLER_INPUT_PAYLOAD_EXPECTED_SIZE = 37;
-constexpr size_t CONTROLER_OUTPUT_INIT_PAYLOAD_SIZE = 1;
-constexpr size_t CONTROLER_OUTPUT_RUMBLE_PAYLOAD_SIZE = 5;
+constexpr size_t CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE = 37;
+constexpr size_t CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE = 25;
+constexpr size_t CONTROLLER_INPUT_SUSPEND_PAYLOAD_EXPECTED_SIZE = 2;
 
-static std::array<u8, CONTROLER_INPUT_PAYLOAD_EXPECTED_SIZE> s_controller_payload;
-static std::array<u8, CONTROLER_INPUT_PAYLOAD_EXPECTED_SIZE> s_controller_payload_swap;
+constexpr size_t CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE = 1;
+constexpr size_t CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE = 1;
+constexpr size_t CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE = 1;
+constexpr size_t CONTROLLER_OUTPUT_HARD_RESET_PAYLOAD_SIZE = 1;
+constexpr size_t CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE = 5;
+
+static std::array<u8, CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE> s_controller_origin_payload;
+static std::array<u8, CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE> s_controller_origin_payload_swap;
+static std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> s_controller_payload;
+static std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> s_controller_payload_swap;
 
 // Only access with s_mutex held!
 static int s_controller_payload_size = {0};
+static int s_controller_origin_payload_size = {0};
 
-static std::array<u8, CONTROLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> s_controller_write_payload;
-static std::atomic<int> s_controller_write_payload_size{0};
+static std::array<u8, CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> s_controller_rumble_payload;
+static std::atomic<int> s_controller_rumble_payload_size{0};
 
-static std::thread s_read_adapter_thread;
-static Common::Flag s_read_adapter_thread_running;
-static std::thread s_write_adapter_thread;
-static Common::Flag s_write_adapter_thread_running;
-static Common::Event s_write_happened;
+static std::thread s_poll_adapter_thread;
+static Common::Flag s_poll_adapter_thread_running;
+static std::thread s_rumble_adapter_thread;
+static Common::Flag s_rumble_adapter_thread_running;
+static Common::Event s_rumble_happened;
+static std::thread s_origin_adapter_thread;
+static Common::Flag s_origin_adapter_thread_running;
+static Common::Event s_origin_requested;
 
-static std::mutex s_read_mutex;
+static std::mutex s_poll_mutex;
+static std::mutex s_origin_mutex;
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
 static std::mutex s_init_mutex;
-#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
 static std::mutex s_write_mutex;
+static std::mutex s_read_mutex;
+#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
+static std::mutex s_rumble_mutex;
 #endif
 
 static std::thread s_adapter_detect_thread;
@@ -149,13 +166,13 @@ static std::array<SerialInterface::SIDevices, SerialInterface::MAX_SI_CHANNELS>
     s_config_si_device_type{};
 static std::array<bool, SerialInterface::MAX_SI_CHANNELS> s_config_rumble_enabled{};
 
-static void Read()
+static void Poll()
 {
-  Common::SetCurrentThreadName("GCAdapter Read Thread");
-  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter read thread started");
+  Common::SetCurrentThreadName("GCAdapter Poll Thread");
+  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter poll thread started");
 
 #if GCADAPTER_USE_ANDROID_IMPLEMENTATION
-  bool first_read = true;
+  bool first_poll = true;
   JNIEnv* const env = IDCache::GetEnvForThread();
 
   const jfieldID payload_field = env->GetStaticFieldID(s_adapter_class, "controller_payload", "[B");
@@ -179,41 +196,46 @@ static void Read()
   }
 #endif
 
-  s_write_adapter_thread_running.Set(true);
-  s_write_adapter_thread = std::thread(Write);
+  s_rumble_adapter_thread_running.Set(true);
+  s_rumble_adapter_thread = std::thread(Rumble);
+  s_origin_adapter_thread_running.Set(true);
+  s_origin_adapter_thread = std::thread(Origins);
 
-  // Reset rumble once on initial reading
+  // Reset rumble once on initial poll
   ResetRumble();
 
-  while (s_read_adapter_thread_running.IsSet())
+  while (s_poll_adapter_thread_running.IsSet())
   {
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
     int payload_size = 0;
-    const int error =
-        libusb_interrupt_transfer(s_handle, s_endpoint_in, s_controller_payload_swap.data(),
-                                  CONTROLER_INPUT_PAYLOAD_EXPECTED_SIZE, &payload_size, 16);
+    int error = LIBUSB_SUCCESS;
+    {
+      std::lock_guard<std::mutex> lk(s_read_mutex);
+      error = libusb_interrupt_transfer(s_handle, s_endpoint_in, s_controller_payload_swap.data(),
+                                CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE, &payload_size, 16);
+    }
     if (error != LIBUSB_SUCCESS)
     {
-      ERROR_LOG_FMT(CONTROLLERINTERFACE, "Read: libusb_interrupt_transfer failed: {}",
+      ERROR_LOG_FMT(CONTROLLERINTERFACE, "Poll: libusb_interrupt_transfer failed: {}",
                     LibusbUtils::ErrorWrap(error));
     }
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
     const int payload_size = env->CallStaticIntMethod(s_adapter_class, input_func);
     jbyte* const java_data = env->GetByteArrayElements(*java_controller_payload, nullptr);
-    std::copy(java_data, java_data + CONTROLER_INPUT_PAYLOAD_EXPECTED_SIZE,
+    std::copy(java_data, java_data + CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE,
               s_controller_payload_swap.begin());
 #endif
     {
-      std::lock_guard<std::mutex> lk(s_read_mutex);
+      std::lock_guard<std::mutex> lk(s_poll_mutex);
       std::swap(s_controller_payload_swap, s_controller_payload);
       s_controller_payload_size = payload_size;
     }
 #if GCADAPTER_USE_ANDROID_IMPLEMENTATION
     env->ReleaseByteArrayElements(*java_controller_payload, java_data, 0);
 
-    if (first_read)
+    if (first_poll)
     {
-      first_read = false;
+      first_poll = false;
       s_fd = env->CallStaticIntMethod(s_adapter_class, getfd_func);
     }
 #endif
@@ -221,12 +243,19 @@ static void Read()
     Common::YieldCPU();
   }
 
-  // Terminate the write thread on leaving
-  if (s_write_adapter_thread_running.TestAndClear())
+  // Terminate the rumble thread on leaving
+  if (s_rumble_adapter_thread_running.TestAndClear())
   {
-    s_controller_write_payload_size.store(0);
-    s_write_happened.Set();  // Kick the waiting event
-    s_write_adapter_thread.join();
+    s_controller_rumble_payload_size.store(0);
+    s_rumble_happened.Set();  // Kick the waiting event
+    s_rumble_adapter_thread.join();
+  }
+
+  // Terminate origin thread
+  if (s_origin_adapter_thread_running.TestAndClear())
+  {
+    s_origin_requested.Set(); // Kick the waiting event  
+    s_origin_adapter_thread.join();
   }
 
 #if GCADAPTER_USE_ANDROID_IMPLEMENTATION
@@ -234,13 +263,13 @@ static void Read()
   s_detected = false;
 #endif
 
-  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter read thread stopped");
+  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter poll thread stopped");
 }
 
-static void Write()
+static void Rumble()
 {
-  Common::SetCurrentThreadName("GCAdapter Write Thread");
-  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter write thread started");
+  Common::SetCurrentThreadName("GCAdapter Rumble Thread");
+  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter rumble thread started");
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
   int size = 0;
@@ -249,28 +278,32 @@ static void Write()
   const jmethodID output_func = env->GetStaticMethodID(s_adapter_class, "Output", "([B)I");
 #endif
 
-  while (s_write_adapter_thread_running.IsSet())
+  while (s_rumble_adapter_thread_running.IsSet())
   {
-    s_write_happened.Wait();
+    s_rumble_happened.Wait();
 
-    const int write_size = s_controller_write_payload_size.load();
-    if (write_size)
+    const int rumble_size = s_controller_rumble_payload_size.load();
+    if (rumble_size)
     {
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
-      const int error = libusb_interrupt_transfer(
-          s_handle, s_endpoint_out, s_controller_write_payload.data(), write_size, &size, 16);
+      int error = LIBUSB_SUCCESS;
+      {
+        std::lock_guard<std::mutex> lk(s_write_mutex);
+        error = libusb_interrupt_transfer(
+            s_handle, s_endpoint_out, s_controller_rumble_payload.data(), rumble_size, &size, 16);
+      }
       if (error != LIBUSB_SUCCESS)
       {
-        ERROR_LOG_FMT(CONTROLLERINTERFACE, "Write: libusb_interrupt_transfer failed: {}",
+        ERROR_LOG_FMT(CONTROLLERINTERFACE, "Rumble: libusb_interrupt_transfer failed: {}",
                       LibusbUtils::ErrorWrap(error));
       }
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
-      const jbyteArray jrumble_array = env->NewByteArray(CONTROLER_OUTPUT_RUMBLE_PAYLOAD_SIZE);
+      const jbyteArray jrumble_array = env->NewByteArray(CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE);
       jbyte* const jrumble = env->GetByteArrayElements(jrumble_array, nullptr);
 
       {
-        std::lock_guard<std::mutex> lk(s_write_mutex);
-        memcpy(jrumble, s_controller_write_payload.data(), write_size);
+        std::lock_guard<std::mutex> lk(s_rumble_mutex);
+        memcpy(jrumble, s_controller_rumble_payload.data(), rumble_size);
       }
 
       env->ReleaseByteArrayElements(jrumble_array, jrumble, 0);
@@ -281,7 +314,93 @@ static void Write()
     Common::YieldCPU();
   }
 
-  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter write thread stopped");
+  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter rumble thread stopped");
+}
+
+static void Origins()
+{
+  Common::SetCurrentThreadName("GCAdapter Origin Thread");
+  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter origin thread started");
+
+  while (true)
+  {
+    s_origin_requested.Wait();
+
+    if (!s_origin_adapter_thread_running.IsSet())
+      break;
+
+    int size = 0;
+    int origin_size = 0;
+    int error = LIBUSB_SUCCESS;
+    bool valid = true;
+
+    {
+      std::lock_guard<std::mutex> read_lk(s_read_mutex);
+      std::lock_guard<std::mutex> write_lk(s_write_mutex);
+      // suspend polling
+      std::array<u8, CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE> suspend_payload = {0x14};
+      error = libusb_interrupt_transfer(s_handle, s_endpoint_out, suspend_payload.data(),
+                                        CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE, &size, 16);
+
+      // read suspend result
+      if (error == LIBUSB_SUCCESS)
+      {
+        std::array<u8, CONTROLLER_INPUT_SUSPEND_PAYLOAD_EXPECTED_SIZE> suspend_result;
+        error =
+            libusb_interrupt_transfer(s_handle, s_endpoint_in, suspend_result.data(),
+                                      CONTROLLER_INPUT_SUSPEND_PAYLOAD_EXPECTED_SIZE, &size, 16);
+         if (size != CONTROLLER_INPUT_SUSPEND_PAYLOAD_EXPECTED_SIZE || suspend_result[0] != 0x24)
+         {
+           valid = false;
+         }
+      }
+
+      // request origins
+      if (error == LIBUSB_SUCCESS && valid)
+      {
+        std::array<u8, CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE> origin_payload = {0x12};
+        error = libusb_interrupt_transfer(s_handle, s_endpoint_out, origin_payload.data(),
+                                          CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE, &size, 16);
+      }
+
+      // read origins
+      if (error == LIBUSB_SUCCESS && valid)
+      {
+        error = libusb_interrupt_transfer(
+            s_handle, s_endpoint_in, s_controller_origin_payload_swap.data(),
+            CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE, &origin_size, 16);
+      }
+
+      // resume polling - try this even if getting the origin failed
+      std::array<u8, CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE> resume_payload = {0x13};
+      int resume_error = libusb_interrupt_transfer(s_handle, s_endpoint_out, resume_payload.data(),
+                                        CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE, &size, 16);
+      if (error == LIBUSB_SUCCESS && resume_error != LIBUSB_SUCCESS)
+      {
+        error = resume_error;
+      }
+    }
+
+    if (error != LIBUSB_SUCCESS)
+    {
+      WARN_LOG_FMT(CONTROLLERINTERFACE, "Origins: libusb_interrupt_transfer failed: {}",
+                   LibusbUtils::ErrorWrap(error));
+    }
+    else if (!valid)
+    {
+      WARN_LOG_FMT(CONTROLLERINTERFACE, "Origins: origin fetch failed");
+    }
+    else
+    {
+      std::lock_guard<std::mutex> lk(s_origin_mutex);
+      std::swap(s_controller_origin_payload_swap, s_controller_origin_payload);
+      s_controller_origin_payload_size = origin_size;
+      s_controller_origin_valid.fill(true);
+      
+    }
+  }
+
+  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter origin thread stopped");
 }
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
@@ -479,11 +598,11 @@ static void Setup()
   s_detected = true;
 
   // Make sure the thread isn't in the middle of shutting down while starting a new one
-  if (s_read_adapter_thread_running.TestAndClear())
-    s_read_adapter_thread.join();
+  if (s_poll_adapter_thread_running.TestAndClear())
+    s_poll_adapter_thread.join();
 
-  s_read_adapter_thread_running.Set(true);
-  s_read_adapter_thread = std::thread(Read);
+  s_poll_adapter_thread_running.Set(true);
+  s_poll_adapter_thread = std::thread(Poll);
 #endif
 }
 
@@ -612,17 +731,17 @@ static void AddGCAdapter(libusb_device* device)
   }
 
   int size = 0;
-  std::array<u8, CONTROLER_OUTPUT_INIT_PAYLOAD_SIZE> payload = {0x13};
+  std::array<u8, CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE> payload = {0x13};
   const int error = libusb_interrupt_transfer(s_handle, s_endpoint_out, payload.data(),
-                                              CONTROLER_OUTPUT_INIT_PAYLOAD_SIZE, &size, 16);
+                                              CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE, &size, 16);
   if (error != LIBUSB_SUCCESS)
   {
     WARN_LOG_FMT(CONTROLLERINTERFACE, "AddGCAdapter: libusb_interrupt_transfer failed: {}",
                  LibusbUtils::ErrorWrap(error));
   }
 
-  s_read_adapter_thread_running.Set(true);
-  s_read_adapter_thread = std::thread(Read);
+  s_poll_adapter_thread_running.Set(true);
+  s_poll_adapter_thread = std::thread(Poll);
 
   s_status = ADAPTER_DETECTED;
   if (s_detect_callback != nullptr)
@@ -667,9 +786,9 @@ static void Reset()
     return;
 #endif
 
-  if (s_read_adapter_thread_running.TestAndClear())
-    s_read_adapter_thread.join();
-  // The read thread will close the write thread
+  if (s_poll_adapter_thread_running.TestAndClear())
+    s_poll_adapter_thread.join();
+  // The poll thread will close the rumble thread
 
   s_controller_type.fill(ControllerType::None);
 
@@ -711,18 +830,18 @@ GCPadStatus Input(int chan)
 #endif
 
   int payload_size = 0;
-  std::array<u8, CONTROLER_INPUT_PAYLOAD_EXPECTED_SIZE> controller_payload_copy{};
+  std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> controller_payload_copy{};
 
   {
-    std::lock_guard<std::mutex> lk(s_read_mutex);
+    std::lock_guard<std::mutex> lk(s_poll_mutex);
     controller_payload_copy = s_controller_payload;
     payload_size = s_controller_payload_size;
   }
 
   GCPadStatus pad = {};
-  if (payload_size != CONTROLER_INPUT_PAYLOAD_EXPECTED_SIZE
+  if (payload_size != CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
-      || controller_payload_copy[0] != LIBUSB_DT_HID
+      || controller_payload_copy[0] != 0x21
 #endif
   )
   {
@@ -736,13 +855,23 @@ GCPadStatus Input(int chan)
   else
   {
     bool get_origin = false;
+    bool new_controller = false;
     // TODO: What do the other bits here indicate?  Does casting to an enum like this make sense?
     const auto type = static_cast<ControllerType>(controller_payload_copy[1 + (9 * chan)] >> 4);
     if (type != ControllerType::None && s_controller_type[chan] == ControllerType::None)
     {
+      new_controller = true;
       NOTICE_LOG_FMT(CONTROLLERINTERFACE, "New device connected to Port {} of Type: {:02x}",
                      chan + 1, controller_payload_copy[1 + (9 * chan)]);
-      get_origin = true;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(s_origin_mutex);
+      if (new_controller)
+      {
+        s_controller_origin_valid[chan] = false;
+      }
+      get_origin = !s_controller_origin_valid[chan];
     }
 
     s_controller_type[chan] = type;
@@ -780,7 +909,10 @@ GCPadStatus Input(int chan)
         pad.button |= PAD_TRIGGER_L;
 
       if (get_origin)
+      {
         pad.button |= PAD_GET_ORIGIN;
+        s_origin_requested.Set();
+      }
 
       pad.stickX = controller_payload_copy[1 + (9 * chan) + 3];
       pad.stickY = controller_payload_copy[1 + (9 * chan) + 4];
@@ -827,13 +959,13 @@ void ResetRumble()
     return;
   ResetRumbleLockNeeded();
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
-  std::array<u8, CONTROLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> rumble = {0x11, 0, 0, 0, 0};
+  std::array<u8, CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> rumble = {0x11, 0, 0, 0, 0};
   {
-    std::lock_guard<std::mutex> lk(s_write_mutex);
-    s_controller_write_payload = rumble;
-    s_controller_write_payload_size.store(CONTROLER_OUTPUT_RUMBLE_PAYLOAD_SIZE);
+    std::lock_guard<std::mutex> lk(s_rumble_mutex);
+    s_controller_rumble_payload = rumble;
+    s_controller_rumble_payload_size.store(CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE);
   }
-  s_write_happened.Set();
+  s_rumble_happened.Set();
 #endif
 }
 
@@ -849,13 +981,13 @@ static void ResetRumbleLockNeeded()
 
   std::fill(std::begin(s_controller_rumble), std::end(s_controller_rumble), 0);
 
-  std::array<u8, CONTROLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> rumble = {
+  std::array<u8, CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> rumble = {
       0x11, s_controller_rumble[0], s_controller_rumble[1], s_controller_rumble[2],
       s_controller_rumble[3]};
 
   int size = 0;
   const int error = libusb_interrupt_transfer(s_handle, s_endpoint_out, rumble.data(),
-                                              CONTROLER_OUTPUT_RUMBLE_PAYLOAD_SIZE, &size, 16);
+                                              CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE, &size, 16);
   if (error != LIBUSB_SUCCESS)
   {
     WARN_LOG_FMT(CONTROLLERINTERFACE, "ResetRumbleLockNeeded: libusb_interrupt_transfer failed: {}",
@@ -865,6 +997,51 @@ static void ResetRumbleLockNeeded()
   INFO_LOG_FMT(CONTROLLERINTERFACE, "Rumble state reset");
 }
 #endif
+
+GCPadStatus Origin(int chan)
+{
+  if (!UseAdapter())
+    return {};
+
+  if (s_handle == nullptr || s_status != ADAPTER_DETECTED)
+    return {};
+
+  int payload_size = 0;
+  std::array<u8, CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE> controller_origin_payload_copy{};
+
+  {
+    std::lock_guard<std::mutex> lk(s_origin_mutex);
+    if (!s_controller_origin_valid[chan])
+      return {};
+    controller_origin_payload_copy = s_controller_origin_payload;
+    payload_size = s_controller_origin_payload_size;
+  }
+
+  GCPadStatus origin = {};
+  if (payload_size != CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE
+#if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
+      || controller_origin_payload_copy[0] != 0x22
+#endif
+  )
+  {
+    // This can occur for a few frames on initialization.
+    ERROR_LOG_FMT(CONTROLLERINTERFACE, "error reading payload (size: {}, type: {:02x})",
+                  payload_size, controller_origin_payload_copy[0]);
+  }
+  else
+  {
+    origin.stickX = controller_origin_payload_copy[1 + (chan * 6)];
+    origin.stickY = controller_origin_payload_copy[1 + (chan * 6) + 1];
+    origin.substickX = controller_origin_payload_copy[1 + (chan * 6) + 2];
+    origin.substickY = controller_origin_payload_copy[1 + (chan * 6) + 3];
+    origin.triggerLeft = controller_origin_payload_copy[1 + (chan * 6) + 4];
+    origin.triggerRight = controller_origin_payload_copy[1 + (chan * 6) + 5];
+  }
+  // TODO: do we need that Core::WantsDeterminism hack?
+  // TODO: handle android implementation
+
+  return origin;
+}
 
 void Output(int chan, u8 rumble_command)
 {
@@ -884,17 +1061,17 @@ void Output(int chan, u8 rumble_command)
       s_controller_type[chan] != ControllerType::Wireless)
   {
     s_controller_rumble[chan] = rumble_command;
-    std::array<u8, CONTROLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> rumble = {
+    std::array<u8, CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> rumble = {
         0x11, s_controller_rumble[0], s_controller_rumble[1], s_controller_rumble[2],
         s_controller_rumble[3]};
     {
 #if GCADAPTER_USE_ANDROID_IMPLEMENTATION
-      std::lock_guard<std::mutex> lk(s_write_mutex);
+      std::lock_guard<std::mutex> lk(s_rumble_mutex);
 #endif
-      s_controller_write_payload = rumble;
-      s_controller_write_payload_size.store(CONTROLER_OUTPUT_RUMBLE_PAYLOAD_SIZE);
+      s_controller_rumble_payload = rumble;
+      s_controller_rumble_payload_size.store(CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE);
     }
-    s_write_happened.Set();
+    s_rumble_happened.Set();
   }
 }
 
