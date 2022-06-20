@@ -332,6 +332,7 @@ static void Origins()
     int size = 0;
     int origin_size = 0;
     int error = LIBUSB_SUCCESS;
+    bool valid = true;
 
     {
       std::lock_guard<std::mutex> read_lk(s_read_mutex);
@@ -342,31 +343,60 @@ static void Origins()
                                         CONTROLLER_OUTPUT_SUSPEND_PAYLOAD_SIZE, &size, 16);
 
       // read suspend result
-      std::array<u8, CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE> suspend_result;
-      error = libusb_interrupt_transfer(s_handle, s_endpoint_in, suspend_result.data(),
-                                        CONTROLLER_INPUT_POLL_PAYLOAD_EXPECTED_SIZE, &size, 16);
+      if (error == LIBUSB_SUCCESS)
+      {
+        std::array<u8, CONTROLLER_INPUT_SUSPEND_PAYLOAD_EXPECTED_SIZE> suspend_result;
+        error =
+            libusb_interrupt_transfer(s_handle, s_endpoint_in, suspend_result.data(),
+                                      CONTROLLER_INPUT_SUSPEND_PAYLOAD_EXPECTED_SIZE, &size, 16);
+         if (size != CONTROLLER_INPUT_SUSPEND_PAYLOAD_EXPECTED_SIZE || suspend_result[0] != 0x24)
+         {
+           valid = false;
+         }
+      }
 
       // request origins
-      std::array<u8, CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE> origin_payload = {0x12};
-      error = libusb_interrupt_transfer(s_handle, s_endpoint_out, origin_payload.data(),
-                                        CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE, &size, 16);
+      if (error == LIBUSB_SUCCESS && valid)
+      {
+        std::array<u8, CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE> origin_payload = {0x12};
+        error = libusb_interrupt_transfer(s_handle, s_endpoint_out, origin_payload.data(),
+                                          CONTROLLER_OUTPUT_ORIGIN_PAYLOAD_SIZE, &size, 16);
+      }
 
       // read origins
-      error = libusb_interrupt_transfer(
-          s_handle, s_endpoint_in, s_controller_origin_payload_swap.data(),
-          CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE, &origin_size, 16);
+      if (error == LIBUSB_SUCCESS && valid)
+      {
+        error = libusb_interrupt_transfer(
+            s_handle, s_endpoint_in, s_controller_origin_payload_swap.data(),
+            CONTROLLER_INPUT_ORIGIN_PAYLOAD_EXPECTED_SIZE, &origin_size, 16);
+      }
 
-      // resume polling
+      // resume polling - try this even if getting the origin failed
       std::array<u8, CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE> resume_payload = {0x13};
-      error = libusb_interrupt_transfer(s_handle, s_endpoint_out, resume_payload.data(),
+      int resume_error = libusb_interrupt_transfer(s_handle, s_endpoint_out, resume_payload.data(),
                                         CONTROLLER_OUTPUT_INIT_PAYLOAD_SIZE, &size, 16);
+      if (error == LIBUSB_SUCCESS && resume_error != LIBUSB_SUCCESS)
+      {
+        error = resume_error;
+      }
     }
 
+    if (error != LIBUSB_SUCCESS)
+    {
+      WARN_LOG_FMT(CONTROLLERINTERFACE, "Origins: libusb_interrupt_transfer failed: {}",
+                   LibusbUtils::ErrorWrap(error));
+    }
+    else if (!valid)
+    {
+      WARN_LOG_FMT(CONTROLLERINTERFACE, "Origins: origin fetch failed");
+    }
+    else
     {
       std::lock_guard<std::mutex> lk(s_origin_mutex);
       std::swap(s_controller_origin_payload_swap, s_controller_origin_payload);
       s_controller_origin_payload_size = origin_size;
       s_controller_origin_valid.fill(true);
+      
     }
   }
 
